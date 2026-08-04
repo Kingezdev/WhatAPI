@@ -71,3 +71,33 @@ def test_forward_to_staff_sends_whatsapp_notification(monkeypatch):
     assistant.forward_to_staff("help", "+15551234567", "human review")
 
     assert post.called
+
+
+def test_reservation_state_persists_in_sqlite(tmp_path):
+    db_path = tmp_path / "conversations.sqlite3"
+
+    assistant_one = AIAssistant(db_path=str(db_path))
+    assistant_one.client = Mock()
+    assistant_one.business_info = {
+        "name": "Test Restaurant",
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant_one.system_prompt = "system"
+    assistant_one.forward_to_staff = Mock()
+
+    assistant_one.generate_response("book a table", "+15551234567")
+    assistant_one.generate_response("Alex", "+15551234567")
+
+    assistant_two = AIAssistant(db_path=str(db_path))
+    assistant_two.client = Mock()
+    assistant_two.business_info = {
+        "name": "Test Restaurant",
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant_two.system_prompt = "system"
+    assistant_two.forward_to_staff = Mock()
+
+    response = assistant_two.generate_response("Friday", "+15551234567")
+
+    assert response == "Perfect. What time would you like to come in?"
+    assert assistant_two.conversation_state["+15551234567"]["reservation_details"]["name"] == "Alex"

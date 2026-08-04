@@ -1,6 +1,7 @@
+import json
 import os
 import re
-import json
+import sqlite3
 from datetime import datetime
 
 import httpx
@@ -11,9 +12,11 @@ load_dotenv()
 
 
 class AIAssistant:
-    def __init__(self):
+    def __init__(self, db_path: str | None = None):
         api_key = os.getenv("OPENAI_API_KEY")
         self.client = OpenAI(api_key=api_key) if api_key else None
+        self.db_path = db_path or os.getenv("SQLITE_DB_PATH", "conversations.sqlite3")
+        self._init_db()
         self.business_info = {
             "name": "Your Business Name",
             "description": "A restaurant/cafe serving delicious food and drinks",
@@ -70,11 +73,79 @@ Guidelines:
 - Keep responses under 160 characters when possible (WhatsApp limit)
 - Use emojis to make responses friendly 🍽️📍⏰"""
 
-        self.conversation_state = {}
+        self.conversation_state = self._load_conversation_state()
         self.staff_phone_number = os.getenv("STAFF_WHATSAPP_NUMBER")
         self.meta_access_token = os.getenv("META_ACCESS_TOKEN")
         self.meta_phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
         self.meta_api_version = os.getenv("META_API_VERSION", "v18.0")
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_state (
+                    sender TEXT PRIMARY KEY,
+                    reservation_name TEXT,
+                    reservation_date TEXT,
+                    reservation_time TEXT,
+                    reservation_party_size TEXT,
+                    awaiting TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+    def _load_conversation_state(self) -> dict:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT sender, reservation_name, reservation_date, reservation_time, reservation_party_size, awaiting FROM conversation_state"
+            ).fetchall()
+
+        state = {}
+        for sender, name, date, time, party_size, awaiting in rows:
+            state[sender] = {
+                "reservation_details": {
+                    "name": name,
+                    "date": date,
+                    "time": time,
+                    "party_size": party_size,
+                },
+                "awaiting": awaiting,
+                "history": [],
+            }
+        return state
+
+    def _save_conversation_state(self, sender: str, state: dict):
+        if not hasattr(self, "db_path"):
+            self.db_path = os.getenv("SQLITE_DB_PATH", "conversations.sqlite3")
+            self._init_db()
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO conversation_state (
+                    sender, reservation_name, reservation_date, reservation_time, reservation_party_size, awaiting, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sender) DO UPDATE SET
+                    reservation_name = excluded.reservation_name,
+                    reservation_date = excluded.reservation_date,
+                    reservation_time = excluded.reservation_time,
+                    reservation_party_size = excluded.reservation_party_size,
+                    awaiting = excluded.awaiting,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    sender,
+                    state["reservation_details"]["name"],
+                    state["reservation_details"]["date"],
+                    state["reservation_details"]["time"],
+                    state["reservation_details"]["party_size"],
+                    state["awaiting"],
+                    datetime.now().isoformat(),
+                ),
+            )
+            conn.commit()
 
     def generate_response(self, message: str, sender: str) -> str:
         """
@@ -93,6 +164,7 @@ Guidelines:
 
         reservation_flow = self._handle_reservation_flow(message, state)
         if reservation_flow is not None:
+            self._save_conversation_state(sender, state)
             state["history"].append({"role": "assistant", "content": reservation_flow})
             return reservation_flow
 
@@ -114,6 +186,7 @@ Guidelines:
             ai_response = response.choices[0].message.content.strip()
 
             state["history"].append({"role": "assistant", "content": ai_response})
+            self._save_conversation_state(sender, state)
 
             if "HUMAN_NEEDED:" in ai_response:
                 self.forward_to_staff(message, sender, ai_response)
