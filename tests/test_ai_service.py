@@ -166,6 +166,30 @@ def test_rule_based_business_questions(monkeypatch):
     assert "Yes" in open_now_response and "10:00 PM" in open_now_response
 
 
+def test_huggingface_fallback_answers_unknown_messages(monkeypatch):
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.client = None
+    assistant.business_info = {
+        "name": "Test Restaurant",
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant.system_prompt = "system"
+    assistant.conversation_state = {}
+    assistant.forward_to_staff = Mock()
+    assistant.huggingface_api_token = "fake-token"
+    assistant.huggingface_model = "test-model"
+
+    post = Mock()
+    post.return_value.raise_for_status.return_value = None
+    post.return_value.json.return_value = [{"generated_text": "A helpful fallback reply."}]
+    monkeypatch.setattr("ai_service.httpx.post", post)
+
+    response = assistant.generate_response("Can you help me with a refund?", "+15551234567")
+
+    assert response == "Please call for more enquiries."
+    assert not post.called
+
+
 def test_reservation_state_persists_in_sqlite(tmp_path):
     db_path = tmp_path / "conversations.sqlite3"
 

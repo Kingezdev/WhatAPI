@@ -3,46 +3,20 @@ import os
 import re
 import sqlite3
 from datetime import datetime, time
-from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
 from openai import OpenAI
-
-# Import Groq - handle if not installed
-try:
-    from groq import Groq
-except ImportError:
-    Groq = None
-
-# Import Hugging Face - handle if not installed
-try:
-    from huggingface_hub import InferenceClient
-except ImportError:
-    InferenceClient = None
 
 load_dotenv()
 
 
 class AIAssistant:
     def __init__(self, db_path: str | None = None):
-        # Initialize OpenAI (fallback)
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        self.client = OpenAI(api_key=openai_api_key) if openai_api_key else None
-        
-        # Initialize Groq (primary)
-        groq_api_key = os.getenv("GROQ_API_KEY")
-        self.groq_client = Groq(api_key=groq_api_key) if groq_api_key and Groq else None
-        self.groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-        
-        # Initialize Hugging Face (secondary fallback)
-        self.huggingface_client = None
-        self.huggingface_api_token = os.getenv("HUGGINGFACE_API_TOKEN")
-        self.huggingface_model = os.getenv("HUGGINGFACE_MODEL", "google/flan-t5-base")
-        
+        api_key = os.getenv("OPENAI_API_KEY")
+        self.client = OpenAI(api_key=api_key) if api_key else None
         self.db_path = db_path or os.getenv("SQLITE_DB_PATH", "conversations.sqlite3")
         self._init_db()
-        
         self.business_info = {
             "name": "Your Business Name",
             "description": "A restaurant/cafe serving delicious food and drinks",
@@ -104,6 +78,8 @@ Guidelines:
         self.meta_access_token = os.getenv("META_ACCESS_TOKEN")
         self.meta_phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
         self.meta_api_version = os.getenv("META_API_VERSION", "v18.0")
+        self.huggingface_api_token = os.getenv("HUGGINGFACE_API_TOKEN")
+        self.huggingface_model = os.getenv("HUGGINGFACE_MODEL", "google/flan-t5-base")
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -175,10 +151,7 @@ Guidelines:
 
     def generate_response(self, message: str, sender: str) -> str:
         """
-        Generate AI response using providers in priority order:
-        1. Groq (fastest, free tier)
-        2. OpenAI (fallback)
-        3. Hugging Face (final fallback)
+        Generate AI response to incoming message while keeping per-sender reservation context.
         """
         sender = sender or "unknown"
         state = self.conversation_state.setdefault(
@@ -191,84 +164,26 @@ Guidelines:
         )
         state["history"].append({"role": "user", "content": message})
 
-        # 1. Try business info queries first (fast, no API call)
         business_response = self._handle_business_info_query(message, state)
         if business_response is not None:
             self._save_conversation_state(sender, state)
             state["history"].append({"role": "assistant", "content": business_response})
             return business_response
 
-        # 2. Try reservation flow
         reservation_flow = self._handle_reservation_flow(message, state)
         if reservation_flow is not None:
             self._save_conversation_state(sender, state)
             state["history"].append({"role": "assistant", "content": reservation_flow})
             return reservation_flow
 
-        # 3. Try AI providers in priority order
-        ai_response = None
-        
-        # Try Groq first (fastest, free)
-        if self.groq_client and not ai_response:
-            ai_response = self._generate_groq_response(message, state)
-        
-        # Try OpenAI as second choice
-        if not ai_response and self.client:
-            ai_response = self._generate_openai_response(message, state)
-        
-        # Try Hugging Face as final fallback
-        if not ai_response:
-            ai_response = self._generate_huggingface_response(message, sender)
-        
-        # If all AI providers fail, use fallback
-        if not ai_response:
-            ai_response = self._get_fallback_response(message)
-
-        state["history"].append({"role": "assistant", "content": ai_response})
-        self._save_conversation_state(sender, state)
-
-        if "HUMAN_NEEDED:" in ai_response:
-            self.forward_to_staff(message, sender, ai_response)
-            return "Your request has been forwarded to our team. They'll get back to you shortly! 👨‍💼"
-
-        return ai_response
-
-    def _generate_groq_response(self, message: str, state: dict) -> Optional[str]:
-        """
-        Generate response using Groq API (primary, fastest option)
-        """
-        try:
-            if not self.groq_client:
-                return None
-
-            # Build conversation history
-            messages = [{"role": "system", "content": self.system_prompt}]
-            for item in state["history"][-6:]:  # Keep last 6 exchanges
-                messages.append({"role": item["role"], "content": item["content"]})
-
-            # Call Groq API
-            chat_completion = self.groq_client.chat.completions.create(
-                messages=messages,
-                model=self.groq_model,
-                temperature=0.7,
-                max_tokens=150,
-                top_p=0.9,
-            )
-
-            response = chat_completion.choices[0].message.content.strip()
-            return response
-
-        except Exception as e:
-            print(f"Groq API error: {e}")
-            return None
-
-    def _generate_openai_response(self, message: str, state: dict) -> Optional[str]:
-        """
-        Generate response using OpenAI API (fallback from Groq)
-        """
         try:
             if not self.client:
-                return None
+                huggingface_response = self._generate_huggingface_response(message, sender)
+                if huggingface_response:
+                    state["history"].append({"role": "assistant", "content": huggingface_response})
+                    self._save_conversation_state(sender, state)
+                    return huggingface_response
+                return "I can help with the menu, hours, and reservations. What would you like to know?"
 
             history_messages = [{"role": "system", "content": self.system_prompt}]
             for item in state["history"][-6:]:
@@ -281,11 +196,25 @@ Guidelines:
                 temperature=0.7
             )
 
-            return response.choices[0].message.content.strip()
+            ai_response = response.choices[0].message.content.strip()
+
+            state["history"].append({"role": "assistant", "content": ai_response})
+            self._save_conversation_state(sender, state)
+
+            if "HUMAN_NEEDED:" in ai_response:
+                self.forward_to_staff(message, sender, ai_response)
+                return "Your request has been forwarded to our team. They'll get back to you shortly! 👨‍💼"
+
+            return ai_response
 
         except Exception as e:
-            print(f"OpenAI API error: {e}")
-            return None
+            print(f"Error generating AI response: {e}")
+            huggingface_response = self._generate_huggingface_response(message, sender)
+            if huggingface_response:
+                state["history"].append({"role": "assistant", "content": huggingface_response})
+                self._save_conversation_state(sender, state)
+                return huggingface_response
+            return "Sorry, I'm having trouble right now. Please try again later or call us directly."
 
     def _is_supported_use_case(self, message: str) -> bool:
         lower_message = message.lower().strip()
@@ -303,18 +232,15 @@ Guidelines:
 
         return False
 
-    def _generate_huggingface_response(self, message: str, sender: str) -> Optional[str]:
-        """
-        Generate response using Hugging Face API (final fallback)
-        """
+    def _generate_huggingface_response(self, message: str, sender: str) -> str | None:
         if not self._is_supported_use_case(message):
             return "Please call for more enquiries."
 
-        token = self.huggingface_api_token or os.getenv("HUGGINGFACE_API_TOKEN")
-        if not token or InferenceClient is None:
+        token = getattr(self, "huggingface_api_token", None) or os.getenv("HUGGINGFACE_API_TOKEN")
+        if not token:
             return None
 
-        model = self.huggingface_model or os.getenv("HUGGINGFACE_MODEL", "google/flan-t5-base")
+        model = getattr(self, "huggingface_model", None) or os.getenv("HUGGINGFACE_MODEL", "google/flan-t5-base")
         prompt = (
             f"You are a helpful restaurant assistant for {self.business_info.get('name', 'this business')}. "
             f"Only answer questions related to the restaurant's menu, opening hours, location, delivery, or reservations. "
@@ -354,19 +280,6 @@ Guidelines:
             print(f"Error calling Hugging Face: {e}")
 
         return None
-
-    def _get_fallback_response(self, message: str) -> str:
-        """
-        Return a fallback response when all AI providers fail
-        """
-        fallbacks = [
-            "I'm here to help! 😊 Could you please ask about our menu, hours, location, or make a reservation?",
-            "How can I assist you today? I can help with menu info, opening hours, reservations, and more!",
-            "Is there something specific you'd like to know about our restaurant?",
-            "We have great menu options and comfortable seating! Would you like to know more?",
-        ]
-        import random
-        return random.choice(fallbacks)
 
     def _handle_business_info_query(self, message: str, state: dict) -> str | None:
         lower_message = message.lower().strip()
@@ -619,22 +532,3 @@ Reason: {reason}
             self.business_info[category].update(data)
             return True
         return False
-
-    def get_ai_provider_status(self) -> dict:
-        """
-        Get the status of all AI providers for debugging
-        """
-        return {
-            "groq": {
-                "available": self.groq_client is not None,
-                "model": self.groq_model if self.groq_client else None
-            },
-            "openai": {
-                "available": self.client is not None,
-                "model": "gpt-3.5-turbo" if self.client else None
-            },
-            "huggingface": {
-                "available": self.huggingface_api_token is not None and InferenceClient is not None,
-                "model": self.huggingface_model if self.huggingface_api_token else None
-            }
-        }
