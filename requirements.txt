@@ -4,7 +4,7 @@ anyio==4.4.0
 certifi==2026.7.22
 click==8.4.2
 distro==1.9.0
-fastapi==0.115.5
+fastapi==0.104.1
 groq==1.6.0
 h11==0.16.0
 httpcore==1.0.9
@@ -20,8 +20,3 @@ sniffio==1.3.1
 starlette==0.38.6
 typing_extensions==4.12.2
 uvicorn[standard]==0.34.0
-
-# Remove numpy and its dependencies
-# Remove transformers, torch, tokenizers (not needed - you're using API)
-# Remove pytest (only needed for development)
-# Remove rich, typer, shellingham (not needed for your API)
