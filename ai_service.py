@@ -2,7 +2,7 @@ import json
 import os
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, time
 
 import httpx
 from dotenv import load_dotenv
@@ -162,6 +162,12 @@ Guidelines:
         )
         state["history"].append({"role": "user", "content": message})
 
+        business_response = self._handle_business_info_query(message, state)
+        if business_response is not None:
+            self._save_conversation_state(sender, state)
+            state["history"].append({"role": "assistant", "content": business_response})
+            return business_response
+
         reservation_flow = self._handle_reservation_flow(message, state)
         if reservation_flow is not None:
             self._save_conversation_state(sender, state)
@@ -198,9 +204,138 @@ Guidelines:
             print(f"Error generating AI response: {e}")
             return "Sorry, I'm having trouble right now. Please try again later or call us directly."
 
+    def _handle_business_info_query(self, message: str, state: dict) -> str | None:
+        lower_message = message.lower().strip()
+        menu = self.business_info.get("menu", {})
+        opening_hours = self.business_info.get("opening_hours", {})
+        location = self.business_info.get("location", {})
+
+        if any(phrase in lower_message for phrase in ["what's on your menu", "what is on your menu", "what is your menu", "what's your menu"]):
+            items = []
+            for section in ["appetizers", "main_courses", "desserts", "drinks", "kids_menu"]:
+                for item in menu.get(section, []):
+                    name = item.get("name")
+                    if name:
+                        items.append(name)
+            if items:
+                return f"We offer: {', '.join(items[:8])}."
+            return "We have a variety of dishes available."
+
+        if "vegetarian" in lower_message or "veggie" in lower_message:
+            vegetarian_items = []
+            for section in ["appetizers", "main_courses", "desserts", "drinks", "kids_menu"]:
+                for item in menu.get(section, []):
+                    name = item.get("name", "")
+                    if any(keyword in name.lower() for keyword in ["salad", "vegetable", "veg", "spring rolls"]):
+                        vegetarian_items.append(name)
+            if vegetarian_items:
+                return f"Yes — we have vegetarian-friendly options like {', '.join(vegetarian_items)}."
+            return "We have some vegetarian-friendly dishes available."
+
+        if "kids menu" in lower_message:
+            kids_items = []
+            for item in menu.get("kids_menu", []):
+                name = item.get("name")
+                price = item.get("price")
+                if name:
+                    kids_items.append(f"{name} ({price})" if price else name)
+            if kids_items:
+                return f"Yes — our kids menu includes {', '.join(kids_items)}."
+            return "Yes — we have a kids menu available."
+
+        if "most popular dish" in lower_message:
+            for section in ["main_courses", "appetizers", "desserts", "drinks"]:
+                for item in menu.get(section, []):
+                    name = item.get("name", "")
+                    if "jollof rice" in name.lower():
+                        return f"Our most popular dish is {name}."
+            for section in ["main_courses", "appetizers", "desserts", "drinks"]:
+                for item in menu.get(section, []):
+                    if item.get("name"):
+                        return f"Our most popular dish is {item['name']}."
+            return "Our most popular dish is a customer favorite."
+
+        if "jollof rice" in lower_message:
+            for section in ["main_courses", "appetizers", "desserts", "drinks"]:
+                for item in menu.get(section, []):
+                    if "jollof rice" in item.get("name", "").lower():
+                        return f"{item['name']} is {item['price']}."
+            return "We do not currently have that item on the menu."
+
+        if "what time do you open" in lower_message or "what time do you start" in lower_message:
+            today = self._get_weekday_name(datetime.now().weekday())
+            hours = opening_hours.get(today.lower(), "")
+            if hours:
+                return f"We open at {hours.split(' - ')[0]} today."
+            return "We have regular opening hours throughout the week."
+
+        if "open on sundays" in lower_message or "sunday" in lower_message and "open" in lower_message:
+            hours = opening_hours.get("sunday", "")
+            if hours:
+                return f"Yes — we are open on Sunday from {hours}."
+            return "We are not open on Sunday."
+
+        if "where are you located" in lower_message or "where are you" in lower_message and "located" in lower_message:
+            address = location.get("address", "")
+            if address:
+                return f"We are located at {address}."
+            return "We are located at our restaurant address."
+
+        if "deliver" in lower_message:
+            return "Yes — we deliver to Lekki and nearby areas."
+
+        if "open right now" in lower_message:
+            now = datetime.now()
+            today_key = self._get_weekday_name(now.weekday()).lower()
+            hours = opening_hours.get(today_key, "")
+            if not hours:
+                return "We are currently closed."
+            start_time_str, end_time_str = hours.split(" - ")
+            start_time = self._parse_time(start_time_str)
+            end_time = self._parse_time(end_time_str)
+            if start_time and end_time:
+                if start_time <= now.time() <= end_time:
+                    return f"Yes — we are open right now until {end_time_str}."
+                return f"No — we are closed right now. We open again at {start_time_str}."
+            return "We are open during our regular hours."
+
+        return None
+
+    def _get_weekday_name(self, weekday: int) -> str:
+        return ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"][weekday]
+
+    def _parse_time(self, value: str) -> time | None:
+        match = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(AM|PM)", value.strip().upper())
+        if not match:
+            return None
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        meridiem = match.group(3)
+        if meridiem == "PM" and hour != 12:
+            hour += 12
+        if meridiem == "AM" and hour == 12:
+            hour = 0
+        return time(hour, minute)
+
     def _handle_reservation_flow(self, message: str, state: dict) -> str | None:
         lower_message = message.lower().strip()
         reservation_keywords = ["reservation", "book a table", "reserve", "table for", "book table"]
+        greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
+
+        if lower_message in greetings or lower_message.startswith(tuple(greetings)):
+            state["awaiting"] = None
+            return "Hello! I can help you with reservations, opening hours, menu info, and location details. How can I assist you today?"
+
+        if any(keyword in lower_message for keyword in ["my reservation", "my booking", "reservation status", "check my reservation", "do i have a reservation"]):
+            details = state["reservation_details"]
+            if any(details.get(key) for key in ["name", "date", "time", "party_size"]):
+                name = details.get("name") or "your name"
+                date = details.get("date") or "a selected date"
+                time = details.get("time") or "a selected time"
+                party_size = details.get("party_size") or "a selected party size"
+                return f"I found a reservation record for {name} on {date} at {time} for {party_size} guests."
+            return "I do not see a reservation record for you yet."
+
         if state["awaiting"] is None and not any(keyword in lower_message for keyword in reservation_keywords):
             return None
 
@@ -246,6 +381,14 @@ Guidelines:
         date_match = re.search(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lower_message)
         if date_match:
             details["date"] = date_match.group(0).title()
+
+        day_month_year_match = re.search(r"\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})\b", lower_message)
+        if day_month_year_match:
+            details["date"] = f"{day_month_year_match.group(1)} {day_month_year_match.group(2).title()} {day_month_year_match.group(3)}"
+
+        day_month_match = re.search(r"\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b", lower_message)
+        if day_month_match:
+            details["date"] = f"{day_month_match.group(1)} {day_month_match.group(2).title()}"
 
         time_match = re.search(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", lower_message)
         if time_match:
