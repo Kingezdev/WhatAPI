@@ -609,6 +609,18 @@ Guidelines:
 
         # Start a new reservation if requested
         if any(keyword in lower_message for keyword in reservation_keywords):
+            extracted = self._extract_reservation_details(message, state)
+            if (
+                extracted["name"] is not None
+                and extracted["date"] is not None
+                and extracted["time"] is not None
+                and extracted["party_size"] is not None
+            ):
+                state["reservation_details"].update(extracted)
+                state["awaiting"] = None
+                self._save_reservation(sender, state["reservation_details"])
+                self._save_conversation_state(sender, state)
+                return "Thanks! I have your reservation details."
             return self._start_reservation_flow(state, sender)
 
         return None
@@ -743,24 +755,27 @@ Guidelines:
         details = {"name": None, "date": None, "time": None, "party_size": None}
         lower_message = message.lower()
 
-        # Extract name (works for "book a table for Alex on Friday at 6pm for 4 guests")
-        name_match = re.search(
-            r"(?:book(?:\s+a\s+table)?|reserve(?:\s+a\s+table)?|reservation|table\s+for|for|under)\s+(?:for\s+)?([a-z][a-z\s'-]+?)(?=\s+(?:on|at|for\s+\d+\s*(?:guests?|people)|$))",
+        # Extract name (works for "book a table for Alex" and "under the name of israel")
+        name_of_match = re.search(
+            r"\b(?:under\s+(?:the\s+)?name\s+(?:of)?|name\s+of)\s+([a-z][a-z\s'-]*?)(?=\s+(?:for|on|at|tomorrow|today|$))",
             lower_message,
             re.IGNORECASE,
         )
-        if name_match:
-            details["name"] = name_match.group(1).strip().title()
+        if name_of_match:
+            details["name"] = name_of_match.group(1).strip().title()
         elif re.search(r"\bname\s+is\s+([a-z][a-z\s'-]+)", lower_message):
             match = re.search(r"\bname\s+is\s+([a-z][a-z\s'-]+)", lower_message)
+            details["name"] = match.group(1).strip().title()
+        elif re.search(r"\bfor\s+([a-z][a-z\s'-]*?)(?=\s+(?:on|at|tomorrow|today|$))", lower_message):
+            match = re.search(r"\bfor\s+([a-z][a-z\s'-]*?)(?=\s+(?:on|at|tomorrow|today|$))", lower_message)
             details["name"] = match.group(1).strip().title()
         elif state and state.get("awaiting") == "name" and re.fullmatch(r"[a-zA-Z][a-zA-Z\s'-]+", message.strip()):
             details["name"] = message.strip().title()
 
         # Extract date
-        date_match = re.search(r"\b(?:on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lower_message)
-        if date_match:
-            details["date"] = date_match.group(1).title()
+        day_name_match = re.search(r"\b(?:on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lower_message)
+        if day_name_match:
+            details["date"] = day_name_match.group(1).title()
 
         # Handle "today", "tomorrow"
         if "today" in lower_message:
@@ -768,12 +783,26 @@ Guidelines:
         elif "tomorrow" in lower_message:
             details["date"] = "tomorrow"
 
+        ordinal_day_month_year_match = re.search(
+            r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})\b",
+            lower_message,
+        )
+        if ordinal_day_month_year_match and details["date"] is None:
+            details["date"] = f"{ordinal_day_month_year_match.group(1)} {ordinal_day_month_year_match.group(2).title()} {ordinal_day_month_year_match.group(3)}"
+
+        ordinal_day_month_match = re.search(
+            r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+            lower_message,
+        )
+        if ordinal_day_month_match and details["date"] is None:
+            details["date"] = f"{ordinal_day_month_match.group(1)} {ordinal_day_month_match.group(2).title()}"
+
         day_month_year_match = re.search(r"\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})\b", lower_message)
-        if day_month_year_match:
+        if day_month_year_match and details["date"] is None:
             details["date"] = f"{day_month_year_match.group(1)} {day_month_year_match.group(2).title()} {day_month_year_match.group(3)}"
 
         day_month_match = re.search(r"\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b", lower_message)
-        if day_month_match:
+        if day_month_match and details["date"] is None:
             details["date"] = f"{day_month_match.group(1)} {day_month_match.group(2).title()}"
 
         # Extract time
@@ -786,6 +815,8 @@ Guidelines:
                 details["time"] = numeric_match.group(1)
 
         # Extract party size
+        if "only me" in lower_message or "just me" in lower_message or "one person" in lower_message:
+            details["party_size"] = "1"
         party_match = re.search(r"\b(?:party\s+of|for|for\s+)(\d+)\b(?:\s*(?:guests?|people))?", lower_message)
         if party_match:
             details["party_size"] = party_match.group(1)

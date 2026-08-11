@@ -184,6 +184,48 @@ def test_single_message_can_book_and_check_menu(monkeypatch):
     assert "Ada" in response or "Saturday" in response
 
 
+def test_date_parsing_accepts_ordinal_day_and_month_formats():
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.client = Mock()
+    assistant.business_info = {
+        "name": "Test Restaurant",
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant.system_prompt = "system"
+    assistant.conversation_state = {}
+    assistant.forward_to_staff = Mock()
+
+    assistant.generate_response("book a table", "+15551234569")
+    assistant.generate_response("Alex", "+15551234569")
+    response = assistant.generate_response("30th August 2023", "+15551234569")
+
+    assert response == "Perfect. What time would you like to come in?"
+    assert assistant.conversation_state["+15551234569"]["reservation_details"]["date"] == "30 August 2023"
+
+
+def test_single_message_reservation_with_name_date_time_and_party_size_is_processed_immediately():
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.client = Mock()
+    assistant.business_info = {
+        "name": "Test Restaurant",
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant.system_prompt = "system"
+    assistant.conversation_state = {}
+    assistant.forward_to_staff = Mock()
+
+    response = assistant.generate_response(
+        "I'll make a reservation under the name of israel for tomorrow at 9pm only me",
+        "+15551234570",
+    )
+
+    assert "Thanks! I have your reservation details." in response
+    assert assistant.conversation_state["+15551234570"]["reservation_details"]["name"] == "Israel"
+    assert assistant.conversation_state["+15551234570"]["reservation_details"]["date"] == "tomorrow"
+    assert assistant.conversation_state["+15551234570"]["reservation_details"]["time"] == "9PM"
+    assert assistant.conversation_state["+15551234570"]["reservation_details"]["party_size"] == "1"
+
+
 def test_rule_based_business_questions(monkeypatch):
     assistant = AIAssistant.__new__(AIAssistant)
     assistant.client = Mock()
