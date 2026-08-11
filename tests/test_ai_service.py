@@ -106,6 +106,84 @@ def test_reservation_status_reads_persisted_details(tmp_path):
     assert response == "I found a reservation record for Alex on Friday at 6PM for 4 guests."
 
 
+def test_same_phone_number_can_have_multiple_reservations(tmp_path):
+    db_path = tmp_path / "multiple_reservations.sqlite3"
+
+    assistant = AIAssistant(db_path=str(db_path))
+    assistant.client = Mock()
+    assistant.business_info = {
+        "name": "Test Restaurant",
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant.system_prompt = "system"
+    assistant.forward_to_staff = Mock()
+
+    assistant.generate_response("book a table", "+15551234567")
+    assistant.generate_response("Alex", "+15551234567")
+    assistant.generate_response("Friday", "+15551234567")
+    assistant.generate_response("6pm", "+15551234567")
+    assistant.generate_response("4", "+15551234567")
+
+    assistant.generate_response("book a table", "+15551234567")
+    assistant.generate_response("Sam", "+15551234567")
+    assistant.generate_response("Saturday", "+15551234567")
+    assistant.generate_response("7pm", "+15551234567")
+    assistant.generate_response("2", "+15551234567")
+
+    response = assistant.generate_response("how many reservations do I have?", "+15551234567")
+
+    assert "You have 2 reservations:" in response
+    assert "Alex" in response and "Sam" in response
+    assert "Friday" in response and "Saturday" in response
+
+
+def test_single_message_can_book_and_report_reservation_count(tmp_path):
+    db_path = tmp_path / "compound_reservation.sqlite3"
+    assistant = AIAssistant(db_path=str(db_path))
+    assistant.client = Mock()
+    assistant.business_info = {
+        "name": "Test Restaurant",
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant.system_prompt = "system"
+    assistant.forward_to_staff = Mock()
+
+    response = assistant.generate_response(
+        "Book a table for Alex on Friday at 6pm for 4 guests and tell me how many reservations I have.",
+        "+15551234567",
+    )
+
+    assert "Thanks! I have your reservation details." in response
+    assert "Alex" in response
+    assert "Friday" in response
+    assert "You have 1 reservation" in response or "I found a reservation record" in response
+
+
+def test_single_message_can_book_and_check_menu(monkeypatch):
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.client = Mock()
+    assistant.business_info = {
+        "name": "Test Restaurant",
+        "menu": {
+            "main_courses": [{"name": "Jollof Rice", "price": "$14.99"}],
+            "appetizers": [{"name": "Spring Rolls", "price": "$8.99"}]
+        },
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant.system_prompt = "system"
+    assistant.conversation_state = {}
+    assistant.forward_to_staff = Mock()
+
+    response = assistant.generate_response(
+        "Book a table for Ada on Saturday at 7pm for 2 and tell me what is on the menu.",
+        "+15551234568",
+    )
+
+    assert "Thanks! I have your reservation details." in response
+    assert "Jollof Rice" in response or "Spring Rolls" in response
+    assert "Ada" in response or "Saturday" in response
+
+
 def test_rule_based_business_questions(monkeypatch):
     assistant = AIAssistant.__new__(AIAssistant)
     assistant.client = Mock()

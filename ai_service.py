@@ -105,6 +105,14 @@ Guidelines:
         self.meta_phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
         self.meta_api_version = os.getenv("META_API_VERSION", "v18.0")
 
+    def _normalize_sender(self, sender: str | None) -> str:
+        if sender is None:
+            return "unknown"
+        sender = str(sender).strip()
+        if not sender:
+            return "unknown"
+        return sender
+
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
             # Main conversation state table
@@ -163,6 +171,7 @@ Guidelines:
             self.db_path = os.getenv("SQLITE_DB_PATH", "conversations.sqlite3")
             self._init_db()
 
+        sender = self._normalize_sender(sender)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
@@ -191,12 +200,16 @@ Guidelines:
 
     def generate_response(self, message: str, sender: str) -> str:
         """
-        Generate AI response using providers in priority order:
-        1. Groq (fastest, free tier)
-        2. OpenAI (fallback)
-        3. Hugging Face (final fallback)
+        Generate AI response using Groq only.
+        Business rules and reservation flow still run first.
+        If Groq is unavailable or fails, return a simple call-for-enquiries message.
         """
-        sender = sender or "unknown"
+        sender = self._normalize_sender(sender)
+        if not hasattr(self, "groq_client"):
+            self.groq_client = None
+        if not hasattr(self, "groq_model"):
+            self.groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
         state = self.conversation_state.setdefault(
             sender,
             {
@@ -207,38 +220,30 @@ Guidelines:
         )
         state["history"].append({"role": "user", "content": message})
 
-        # 1. Try business info queries first (fast, no API call)
+        compound_response = self._handle_compound_request(message, state, sender)
+        if compound_response is not None:
+            state["history"].append({"role": "assistant", "content": compound_response})
+            self._save_conversation_state(sender, state)
+            return compound_response
+
         business_response = self._handle_business_info_query(message, state)
         if business_response is not None:
             self._save_conversation_state(sender, state)
             state["history"].append({"role": "assistant", "content": business_response})
             return business_response
 
-        # 2. Try reservation flow
         reservation_flow = self._handle_reservation_flow(message, state, sender)
         if reservation_flow is not None:
             self._save_conversation_state(sender, state)
             state["history"].append({"role": "assistant", "content": reservation_flow})
             return reservation_flow
 
-        # 3. Try AI providers in priority order
         ai_response = None
-        
-        # Try Groq first (fastest, free)
-        if self.groq_client and not ai_response:
+        if self.groq_client:
             ai_response = self._generate_groq_response(message, state)
-        
-        # Try OpenAI as second choice
-        if not ai_response and self.client:
-            ai_response = self._generate_openai_response(message, state)
-        
-        # Try Hugging Face as final fallback
+
         if not ai_response:
-            ai_response = self._generate_huggingface_response(message, sender)
-        
-        # If all AI providers fail, use fallback
-        if not ai_response:
-            ai_response = self._get_fallback_response(message)
+            ai_response = "Please call for more enquiries."
 
         state["history"].append({"role": "assistant", "content": ai_response})
         self._save_conversation_state(sender, state)
@@ -371,27 +376,16 @@ Guidelines:
 
         return None
 
-    def _get_fallback_response(self, message: str) -> str:
-        """
-        Return a fallback response when all AI providers fail
-        """
-        fallbacks = [
-            "I'm here to help! 😊 Would you like to make a reservation, see our menu, or check our hours?",
-            "How can I assist you today? I can help with reservations, menu info, opening hours, and more!",
-            "Is there something specific you'd like to know about our restaurant? We're here to help!",
-            "We have great menu options and comfortable seating! Would you like to know more or make a reservation?",
-            "I can help with reservations, menu items, hours, and location. What would you like to know? 🍽️"
-        ]
-        import random
-        return random.choice(fallbacks)
-
     def _handle_business_info_query(self, message: str, state: dict) -> str | None:
         lower_message = message.lower().strip()
         menu = self.business_info.get("menu", {})
         opening_hours = self.business_info.get("opening_hours", {})
         location = self.business_info.get("location", {})
 
-        if any(phrase in lower_message for phrase in ["what's on your menu", "what is on your menu", "what is your menu", "what's your menu"]):
+        if any(phrase in lower_message for phrase in [
+            "what's on your menu", "what is on your menu", "what is on the menu",
+            "what's on the menu", "what is your menu", "what's your menu"
+        ]):
             items = []
             for section in ["appetizers", "main_courses", "desserts", "drinks", "kids_menu"]:
                 for item in menu.get(section, []):
@@ -498,6 +492,61 @@ Guidelines:
             hour = 0
         return time(hour, minute)
 
+    def _build_reservation_count_message(self, sender: str) -> str:
+        active_reservations = self._get_active_reservations(sender)
+        if not active_reservations:
+            return "You do not have any active reservations right now."
+
+        count = len(active_reservations)
+        if count == 1:
+            res = active_reservations[0]
+            return f"You have 1 reservation: {res['name']} - {res['date']} at {res['time']} for {res['party_size']} guests."
+
+        summary = f"You have {count} reservations:\n"
+        for i, res in enumerate(active_reservations, 1):
+            summary += f"{i}. {res['name']} - {res['date']} at {res['time']} for {res['party_size']} guests\n"
+        return summary.strip()
+
+    def _handle_compound_request(self, message: str, state: dict, sender: str) -> str | None:
+        lower_message = message.lower().strip()
+        booking_keywords = ["book", "reserve", "reservation", "table for", "book a table", "book table"]
+        count_keywords = [
+            "how many reservation", "how many reservations", "how many bookings",
+            "how many reservations do i have", "how many reservations belong to me",
+            "my reservation status", "check my reservation"
+        ]
+
+        business_query = self._handle_business_info_query(message, state)
+        wants_booking = any(keyword in lower_message for keyword in booking_keywords)
+        wants_count = any(keyword in lower_message for keyword in count_keywords)
+        wants_extra = business_query is not None
+
+        if not wants_booking or not (wants_count or wants_extra):
+            return None
+
+        extracted = self._extract_reservation_details(message, state)
+        if not extracted["name"] or not extracted["date"] or not extracted["time"] or not extracted["party_size"]:
+            return None
+
+        state["reservation_details"].update(extracted)
+        state["awaiting"] = None
+        self._save_reservation(sender, state["reservation_details"])
+        self._save_conversation_state(sender, state)
+
+        booking_summary = (
+            "Thanks! I have your reservation details. "
+            f"Your reservation is for {state['reservation_details']['name']} on "
+            f"{state['reservation_details']['date']} at {state['reservation_details']['time']} for "
+            f"{state['reservation_details']['party_size']} guests."
+        )
+
+        parts = [booking_summary]
+        if wants_count:
+            parts.append(self._build_reservation_count_message(sender))
+        if wants_extra:
+            parts.append(business_query)
+        return " ".join(parts)
+
     def _handle_reservation_flow(self, message: str, state: dict, sender: str) -> str | None:
         """
         Handle reservation flow with proper confirmation, cancellation, and status checking.
@@ -523,22 +572,26 @@ Guidelines:
             return "Hello! I can help you with reservations, opening hours, menu info, and location details. How can I assist you today?"
 
         # Handle reservation status query
-        if any(keyword in lower_message for keyword in ["my reservation", "my booking", "reservation status", "check my reservation", "do i have a reservation", "how many reservation", "how many bookings"]):
-            # Check for active reservations in the database
+        if any(keyword in lower_message for keyword in [
+            "my reservation", "my booking", "reservation status", "check my reservation",
+            "do i have a reservation", "how many reservation", "how many reservations",
+            "how many bookings", "how many reservations do i have", "how many reservations belong to me"
+        ]):
+            # Check for active reservations in the database by sender phone number
             active_reservations = self._get_active_reservations(sender)
-            
+
             if active_reservations:
                 count = len(active_reservations)
                 if count == 1:
                     res = active_reservations[0]
-                    return f"I found a reservation record for {res['name']} on {res['date']} at {res['time']} for {res['party_size']} guests. 📝"
+                    return f"I found a reservation record for {res['name']} on {res['date']} at {res['time']} for {res['party_size']} guests."
                 else:
                     # Multiple reservations
                     summary = f"You have {count} reservations:\n"
                     for i, res in enumerate(active_reservations, 1):
                         summary += f"{i}. {res['name']} - {res['date']} at {res['time']} for {res['party_size']} guests\n"
                     return summary.strip()
-            
+
             # Check in-memory state as fallback
             details = state["reservation_details"]
             if any(details.get(key) for key in ["name", "date", "time", "party_size"]):
@@ -547,8 +600,8 @@ Guidelines:
                 time = details.get("time") or "a selected time"
                 party_size = details.get("party_size") or "a selected party size"
                 return f"I found a reservation record for {name} on {date} at {time} for {party_size} guests."
-            
-            return "I do not see any active reservations for you. Would you like to make one? 📝"
+
+            return "I do not see any active reservations for you. Would you like to make one?"
 
         # Check if we're in the middle of a reservation flow
         if state["awaiting"] is not None:
@@ -566,14 +619,14 @@ Guidelines:
         """
         state["awaiting"] = "name"
         self._save_conversation_state(sender, state)
-        return "Absolutely — I can help with that. What name should I book under? 📝"
+        return "Absolutely — I can help with that. What name should I book under?"
 
     def _continue_reservation_flow(self, message: str, state: dict, sender: str) -> str:
         """
         Continue an existing reservation flow based on what we're awaiting.
         """
         details = state["reservation_details"]
-        
+
         # Extract any information from the message
         extracted = self._extract_reservation_details(message, state)
         for key, value in extracted.items():
@@ -583,28 +636,28 @@ Guidelines:
         # Handle each step based on what we're waiting for
         if state["awaiting"] == "name":
             if details["name"] is None:
-                return "What name should I book under? 📝"
+                return "What name should I book under?"
             state["awaiting"] = "date"
             self._save_conversation_state(sender, state)
-            return f"Great {details['name']}! What date would you like to reserve? 📅"
+            return "Great, what date would you like to reserve?"
 
         if state["awaiting"] == "date":
             if details["date"] is None:
-                return "What date would you like to reserve? 📅"
+                return "What date would you like to reserve?"
             state["awaiting"] = "time"
             self._save_conversation_state(sender, state)
-            return f"Perfect! What time would you like to come in? ⏰"
+            return "Perfect. What time would you like to come in?"
 
         if state["awaiting"] == "time":
             if details["time"] is None:
-                return "What time would you like to come in? ⏰"
+                return "What time would you like to come in?"
             state["awaiting"] = "party_size"
             self._save_conversation_state(sender, state)
-            return f"Wonderful! How many guests will be joining you? 🍽️"
+            return "Wonderful. How many guests will be joining you?"
 
         if state["awaiting"] == "party_size":
             if details["party_size"] is None:
-                return "How many guests will be joining you? 🍽️"
+                return "How many guests will be joining you?"
             
             # All details collected - confirm and save
             state["awaiting"] = None
@@ -617,20 +670,24 @@ Guidelines:
                 reason="New reservation created"
             )
             
-            response = f"📝 Reservation confirmed for {details['name']} on {details['date']} at {details['time']} for {details['party_size']} guests! 🎉\n\nWe'll see you then! 😊"
-            
-            # Reset for next reservation
-            state["reservation_details"] = {"name": None, "date": None, "time": None, "party_size": None}
+            response = "Thanks! I have your reservation details."
+
+            # Keep reservation details in memory so status checks can read them later.
             self._save_conversation_state(sender, state)
-            
+
             return response
 
-        return "I'm not sure what you mean. Let's start over. What name should I book under? 📝"
+        return "I'm not sure what you mean. Let's start over. What name should I book under?"
 
     def _save_reservation(self, sender: str, details: dict):
         """
-        Save a reservation to the database.
+        Save a reservation to the database keyed by the sender's phone number.
         """
+        if not hasattr(self, "db_path"):
+            self.db_path = os.getenv("SQLITE_DB_PATH", "conversations.sqlite3")
+            self._init_db()
+
+        sender = self._normalize_sender(sender)
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
@@ -655,15 +712,16 @@ Guidelines:
 
     def _get_active_reservations(self, sender: str) -> list:
         """
-        Get all active reservations for a sender.
+        Get all active reservations for a sender phone number.
         """
+        sender = self._normalize_sender(sender)
         try:
             with sqlite3.connect(self.db_path) as conn:
                 rows = conn.execute(
-                    "SELECT name, date, time, party_size FROM reservations WHERE sender = ? AND status = 'active'",
+                    "SELECT name, date, time, party_size FROM reservations WHERE sender = ? AND status = 'active' ORDER BY id ASC",
                     (sender,)
                 ).fetchall()
-                
+
             return [
                 {"name": row[0], "date": row[1], "time": row[2], "party_size": row[3]}
                 for row in rows
@@ -685,20 +743,24 @@ Guidelines:
         details = {"name": None, "date": None, "time": None, "party_size": None}
         lower_message = message.lower()
 
-        # Extract name
-        if re.search(r"\bname\s+is\s+([a-z][a-z\s'-]+)", lower_message):
+        # Extract name (works for "book a table for Alex on Friday at 6pm for 4 guests")
+        name_match = re.search(
+            r"(?:book(?:\s+a\s+table)?|reserve(?:\s+a\s+table)?|reservation|table\s+for|for|under)\s+(?:for\s+)?([a-z][a-z\s'-]+?)(?=\s+(?:on|at|for\s+\d+\s*(?:guests?|people)|$))",
+            lower_message,
+            re.IGNORECASE,
+        )
+        if name_match:
+            details["name"] = name_match.group(1).strip().title()
+        elif re.search(r"\bname\s+is\s+([a-z][a-z\s'-]+)", lower_message):
             match = re.search(r"\bname\s+is\s+([a-z][a-z\s'-]+)", lower_message)
-            details["name"] = match.group(1).strip().title()
-        elif re.search(r"for\s+([a-z][a-z\s'-]+)", lower_message) and "for 4" not in lower_message:
-            match = re.search(r"for\s+([a-z][a-z\s'-]+)", lower_message)
             details["name"] = match.group(1).strip().title()
         elif state and state.get("awaiting") == "name" and re.fullmatch(r"[a-zA-Z][a-zA-Z\s'-]+", message.strip()):
             details["name"] = message.strip().title()
 
         # Extract date
-        date_match = re.search(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lower_message)
+        date_match = re.search(r"\b(?:on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lower_message)
         if date_match:
-            details["date"] = date_match.group(0).title()
+            details["date"] = date_match.group(1).title()
 
         # Handle "today", "tomorrow"
         if "today" in lower_message:
@@ -715,7 +777,7 @@ Guidelines:
             details["date"] = f"{day_month_match.group(1)} {day_month_match.group(2).title()}"
 
         # Extract time
-        time_match = re.search(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", lower_message)
+        time_match = re.search(r"\b(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", lower_message)
         if time_match:
             details["time"] = time_match.group(1).upper()
         elif re.search(r"\b(\d{1,2})\b", lower_message):
@@ -724,7 +786,7 @@ Guidelines:
                 details["time"] = numeric_match.group(1)
 
         # Extract party size
-        party_match = re.search(r"\b(?:party of|for|for\s+)(\d+)\b", lower_message)
+        party_match = re.search(r"\b(?:party\s+of|for|for\s+)(\d+)\b(?:\s*(?:guests?|people))?", lower_message)
         if party_match:
             details["party_size"] = party_match.group(1)
         elif state and state.get("awaiting") == "party_size" and re.search(r"\b(\d+)\b", lower_message):
