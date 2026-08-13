@@ -252,6 +252,56 @@ def test_make_another_reservation_reuses_previous_details_without_prompting_for_
     assert assistant.conversation_state["+15551234571"]["reservation_details"]["party_size"] == "2"
 
 
+def test_grok_status_reading_handles_multiple_reservations_without_restarting_booking(monkeypatch, tmp_path):
+    db_path = tmp_path / "grok_status.sqlite3"
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.client = Mock()
+    assistant.groq_client = Mock()
+    assistant.groq_model = "test-model"
+    assistant.business_info = {
+        "name": "Test Restaurant",
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant.system_prompt = "system"
+    assistant.conversation_state = {}
+    assistant.forward_to_staff = Mock()
+    assistant.db_path = str(db_path)
+    assistant._init_db()
+
+    assistant._save_reservation("+15551234572", {"name": "Alex", "date": "Friday", "time": "6PM", "party_size": "4"})
+    assistant._save_reservation("+15551234572", {"name": "Sam", "date": "Saturday", "time": "7PM", "party_size": "2"})
+
+    monkeypatch.setattr(assistant, "_infer_grok_intent", lambda message, state: {"intent": "reservation_status", "reservation_details": {}})
+
+    response = assistant.generate_response("ok what are the reservation details for the two", "+15551234572")
+
+    assert "You have 2 reservations:" in response
+    assert "Alex" in response
+    assert "Sam" in response
+
+
+def test_unknown_message_asks_for_clarification_when_grok_cannot_understand(monkeypatch):
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.client = Mock()
+    assistant.groq_client = Mock()
+    assistant.groq_model = "test-model"
+    assistant.business_info = {
+        "name": "Test Restaurant",
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant.system_prompt = "system"
+    assistant.conversation_state = {}
+    assistant.forward_to_staff = Mock()
+    assistant.db_path = os.path.join(os.getcwd(), "tmp_grok_clarify_test.sqlite3")
+    assistant._init_db()
+
+    monkeypatch.setattr(assistant, "_infer_grok_intent", lambda message, state: None)
+
+    response = assistant.generate_response("asdkjlasd qwe zxc", "+15551234573")
+
+    assert response == "I'm not sure what you mean. Could you please clarify?"
+
+
 def test_rule_based_business_questions(monkeypatch):
     assistant = AIAssistant.__new__(AIAssistant)
     assistant.client = Mock()

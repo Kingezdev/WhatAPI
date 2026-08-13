@@ -220,25 +220,24 @@ Guidelines:
         )
         state["history"].append({"role": "user", "content": message})
 
-        lower_message = message.lower().strip()
-        grok_freeform_patterns = [
-            "another reservation",
-            "make another reservation",
-            "same as before",
-            "same as last time",
-            "with the same",
-            "with thesame",
-            "under the name of",
-            "under the name",
-            "same reservation",
-        ]
-        grok_intent = None
-        if self.groq_client and any(pattern in lower_message for pattern in grok_freeform_patterns):
+        if state["awaiting"] is None and self.groq_client:
             grok_intent = self._infer_grok_intent(message, state)
             if grok_intent:
                 intent = grok_intent.get("intent")
                 extracted = grok_intent.get("reservation_details") or {}
                 booking_ready = all(extracted.get(key) is not None for key in ["name", "date", "time", "party_size"])
+
+                if intent == "reservation_status":
+                    active_reservations = self._get_active_reservations(sender)
+                    if active_reservations:
+                        if len(active_reservations) == 1:
+                            res = active_reservations[0]
+                            response = f"I found a reservation record for {res['name']} on {res['date']} at {res['time']} for {res['party_size']} guests."
+                        else:
+                            response = self._build_reservation_count_message(sender)
+                        state["history"].append({"role": "assistant", "content": response})
+                        self._save_conversation_state(sender, state)
+                        return response
 
                 if intent == "reservation" and booking_ready:
                     state["reservation_details"].update({
@@ -247,8 +246,28 @@ Guidelines:
                     state["awaiting"] = None
                     self._save_reservation(sender, state["reservation_details"])
                     self._save_conversation_state(sender, state)
+
+                    compound_response = self._handle_compound_request(message, state, sender)
+                    if compound_response is not None:
+                        state["history"].append({"role": "assistant", "content": compound_response})
+                        self._save_conversation_state(sender, state)
+                        return compound_response
+
                     response = "Thanks! I have your reservation details."
                     state["history"].append({"role": "assistant", "content": response})
+                    return response
+
+                if intent == "business_info":
+                    business_response = self._handle_business_info_query(message, state)
+                    if business_response is not None:
+                        self._save_conversation_state(sender, state)
+                        state["history"].append({"role": "assistant", "content": business_response})
+                        return business_response
+
+                if intent == "greeting":
+                    response = "Hello! I can help you with reservations, opening hours, menu info, and location details. How can I assist you today?"
+                    state["history"].append({"role": "assistant", "content": response})
+                    self._save_conversation_state(sender, state)
                     return response
 
         compound_response = self._handle_compound_request(message, state, sender)
@@ -268,6 +287,13 @@ Guidelines:
             self._save_conversation_state(sender, state)
             state["history"].append({"role": "assistant", "content": reservation_flow})
             return reservation_flow
+
+        if self.groq_client and not self._is_supported_use_case(message):
+            # Only ask for clarification after the normal reservation and business rules have failed.
+            # This keeps the booking flow deterministic while still allowing Grok to interpret natural language.
+            state["history"].append({"role": "assistant", "content": "I'm not sure what you mean. Could you please clarify?"})
+            self._save_conversation_state(sender, state)
+            return "I'm not sure what you mean. Could you please clarify?"
 
         ai_response = None
         if self.groq_client:
@@ -360,11 +386,13 @@ Return only valid JSON with this shape:
   }}
 }}
 Rules:
-- If the user says 'another reservation', 'same as before', or similar, reuse the existing name/date/time/party_size unless the message clearly changes them.
+- A completed reservation is only valid when the same message clearly includes a guest name, a date, a time, and a party size, or clearly updates at least one of those fields for a new reservation.
+- Generic requests like 'book a table', 'make a reservation', or 'reserve a table' are NOT complete reservations. They are general booking start requests, not a saved booking.
+- If the user says 'another reservation', 'same as before', or similar, only reuse previous values when the message is clearly a repeat booking request, not when it is merely a generic booking start.
 - If the user asks for count/status, use intent 'reservation_status'.
 - If the user asks about menu/opening hours/location, use 'business_info'.
 - If the user is greeting, use 'greeting'.
-- Otherwise, if the message is clearly asking to book a table and includes enough information to infer all details, use 'reservation'.
+- If the message is vague or missing essential reservation information, return 'general' rather than guessing.
 - Do not include markdown fences. Only output raw JSON.
 Message: {message}
 """
@@ -732,6 +760,7 @@ Message: {message}
         """
         Start a new reservation process.
         """
+        state["reservation_details"] = {"name": None, "date": None, "time": None, "party_size": None}
         state["awaiting"] = "name"
         self._save_conversation_state(sender, state)
         return "Absolutely — I can help with that. What name should I book under?"
@@ -803,8 +832,21 @@ Message: {message}
             self._init_db()
 
         sender = self._normalize_sender(sender)
+        normalized_details = {
+            "name": (details.get("name") or "").strip(),
+            "date": (details.get("date") or "").strip(),
+            "time": (details.get("time") or "").strip().upper(),
+            "party_size": (details.get("party_size") or "").strip(),
+        }
         try:
             with sqlite3.connect(self.db_path) as conn:
+                existing = conn.execute(
+                    "SELECT 1 FROM reservations WHERE sender = ? AND name = ? AND date = ? AND time = ? AND party_size = ? AND status = 'active' LIMIT 1",
+                    (sender, normalized_details["name"], normalized_details["date"], normalized_details["time"], normalized_details["party_size"]),
+                ).fetchone()
+                if existing:
+                    return
+
                 conn.execute(
                     """
                     INSERT INTO reservations (
@@ -813,10 +855,10 @@ Message: {message}
                     """,
                     (
                         sender,
-                        details["name"],
-                        details["date"],
-                        details["time"],
-                        details["party_size"],
+                        normalized_details["name"],
+                        normalized_details["date"],
+                        normalized_details["time"],
+                        normalized_details["party_size"],
                         datetime.now().isoformat(),
                         "active"
                     )
