@@ -226,6 +226,32 @@ def test_single_message_reservation_with_name_date_time_and_party_size_is_proces
     assert assistant.conversation_state["+15551234570"]["reservation_details"]["party_size"] == "1"
 
 
+def test_make_another_reservation_reuses_previous_details_without_prompting_for_name_again():
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.client = Mock()
+    assistant.business_info = {
+        "name": "Test Restaurant",
+        "reservation_policy": "Reservations can be made for parties of 2 or more."
+    }
+    assistant.system_prompt = "system"
+    assistant.conversation_state = {}
+    assistant.forward_to_staff = Mock()
+
+    assistant.generate_response("book a table", "+15551234571")
+    assistant.generate_response("Israel", "+15551234571")
+    assistant.generate_response("Friday", "+15551234571")
+    assistant.generate_response("9pm", "+15551234571")
+    assistant.generate_response("2", "+15551234571")
+
+    response = assistant.generate_response("make another reservation for friday with thesame now", "+15551234571")
+
+    assert "Thanks! I have your reservation details." in response
+    assert assistant.conversation_state["+15551234571"]["reservation_details"]["name"] == "Israel"
+    assert assistant.conversation_state["+15551234571"]["reservation_details"]["date"] == "Friday"
+    assert assistant.conversation_state["+15551234571"]["reservation_details"]["time"] == "9PM"
+    assert assistant.conversation_state["+15551234571"]["reservation_details"]["party_size"] == "2"
+
+
 def test_rule_based_business_questions(monkeypatch):
     assistant = AIAssistant.__new__(AIAssistant)
     assistant.client = Mock()

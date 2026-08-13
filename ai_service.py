@@ -220,6 +220,37 @@ Guidelines:
         )
         state["history"].append({"role": "user", "content": message})
 
+        lower_message = message.lower().strip()
+        grok_freeform_patterns = [
+            "another reservation",
+            "make another reservation",
+            "same as before",
+            "same as last time",
+            "with the same",
+            "with thesame",
+            "under the name of",
+            "under the name",
+            "same reservation",
+        ]
+        grok_intent = None
+        if self.groq_client and any(pattern in lower_message for pattern in grok_freeform_patterns):
+            grok_intent = self._infer_grok_intent(message, state)
+            if grok_intent:
+                intent = grok_intent.get("intent")
+                extracted = grok_intent.get("reservation_details") or {}
+                booking_ready = all(extracted.get(key) is not None for key in ["name", "date", "time", "party_size"])
+
+                if intent == "reservation" and booking_ready:
+                    state["reservation_details"].update({
+                        key: value for key, value in extracted.items() if value is not None
+                    })
+                    state["awaiting"] = None
+                    self._save_reservation(sender, state["reservation_details"])
+                    self._save_conversation_state(sender, state)
+                    response = "Thanks! I have your reservation details."
+                    state["history"].append({"role": "assistant", "content": response})
+                    return response
+
         compound_response = self._handle_compound_request(message, state, sender)
         if compound_response is not None:
             state["history"].append({"role": "assistant", "content": compound_response})
@@ -307,6 +338,53 @@ Guidelines:
         except Exception as e:
             print(f"OpenAI API error: {e}")
             return None
+
+    def _infer_grok_intent(self, message: str, state: dict) -> dict | None:
+        """
+        Ask Grok to classify the message and extract reservation details before the hardcoded flow takes over.
+        This keeps a safe fallback, but lets the model decide intent using context instead of a growing list of phrases.
+        """
+        try:
+            previous = state.get("reservation_details", {})
+            prompt = f"""
+You are a restaurant assistant. Decide the user's intent from the message below.
+Use the previous reservation context if needed: {json.dumps(previous, default=str)}
+Return only valid JSON with this shape:
+{{
+  "intent": "reservation" | "reservation_status" | "business_info" | "greeting" | "general",
+  "reservation_details": {{
+    "name": "string or null",
+    "date": "string or null",
+    "time": "string or null",
+    "party_size": "string or null"
+  }}
+}}
+Rules:
+- If the user says 'another reservation', 'same as before', or similar, reuse the existing name/date/time/party_size unless the message clearly changes them.
+- If the user asks for count/status, use intent 'reservation_status'.
+- If the user asks about menu/opening hours/location, use 'business_info'.
+- If the user is greeting, use 'greeting'.
+- Otherwise, if the message is clearly asking to book a table and includes enough information to infer all details, use 'reservation'.
+- Do not include markdown fences. Only output raw JSON.
+Message: {message}
+"""
+            response = self.groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                model=self.groq_model,
+                temperature=0.2,
+                max_tokens=200,
+            )
+            raw = response.choices[0].message.content.strip()
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception as e:
+            print(f"Groq intent parsing error: {e}")
+        return None
 
     def _is_supported_use_case(self, message: str) -> bool:
         lower_message = message.lower().strip()
@@ -585,12 +663,10 @@ Guidelines:
                 if count == 1:
                     res = active_reservations[0]
                     return f"I found a reservation record for {res['name']} on {res['date']} at {res['time']} for {res['party_size']} guests."
-                else:
-                    # Multiple reservations
-                    summary = f"You have {count} reservations:\n"
-                    for i, res in enumerate(active_reservations, 1):
-                        summary += f"{i}. {res['name']} - {res['date']} at {res['time']} for {res['party_size']} guests\n"
-                    return summary.strip()
+                summary = f"You have {count} reservations:\n"
+                for i, res in enumerate(active_reservations, 1):
+                    summary += f"{i}. {res['name']} - {res['date']} at {res['time']} for {res['party_size']} guests\n"
+                return summary.strip()
 
             # Check in-memory state as fallback
             details = state["reservation_details"]
@@ -606,6 +682,33 @@ Guidelines:
         # Check if we're in the middle of a reservation flow
         if state["awaiting"] is not None:
             return self._continue_reservation_flow(message, state, sender)
+
+        # Reuse the same reservation details for follow-up requests like
+        # "make another reservation for Friday with the same now"
+        if any(phrase in lower_message for phrase in [
+            "another reservation",
+            "make another reservation",
+            "make a reservation again",
+            "same reservation",
+            "with the same",
+            "with thesame",
+            "same as before",
+            "same as last time",
+        ]):
+            reused = state["reservation_details"].copy()
+            extracted = self._extract_reservation_details(message, state)
+            for key, value in extracted.items():
+                if value is not None:
+                    reused[key] = value
+            for key in ["name", "date", "time", "party_size"]:
+                if reused.get(key) is None:
+                    reused[key] = state["reservation_details"].get(key)
+            if all(reused.get(key) is not None for key in ["name", "date", "time", "party_size"]):
+                state["reservation_details"].update(reused)
+                state["awaiting"] = None
+                self._save_reservation(sender, state["reservation_details"])
+                self._save_conversation_state(sender, state)
+                return "Thanks! I have your reservation details."
 
         # Start a new reservation if requested
         if any(keyword in lower_message for keyword in reservation_keywords):
