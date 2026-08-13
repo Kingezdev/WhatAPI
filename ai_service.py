@@ -661,12 +661,22 @@ Message: {message}
         reservation_keywords = ["reservation", "book a table", "reserve", "table for", "book table"]
         greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
 
+        if state.get("multi_booking"):
+            return self._continue_multi_reservation_flow(message, state, sender)
+
+        if "second reservation" in lower_message and ("30 august" in lower_message or any(word in lower_message for word in ["august", "january", "february", "march", "april", "may", "june", "july", "september", "october", "november", "december"])) and ("instead" in lower_message or "change" in lower_message or "update" in lower_message):
+            date_value = self._extract_reservation_details(message, state).get("date")
+            if date_value:
+                self._update_specific_reservation(sender, 1, "date", date_value)
+                return "Updated the second reservation."
+
         # Handle cancellation requests first
         if any(word in lower_message for word in ["cancel", "abort", "stop", "nevermind", "forget it"]):
             if state["awaiting"] is not None:
                 state["awaiting"] = None
                 # Reset reservation details
                 state["reservation_details"] = {"name": None, "date": None, "time": None, "party_size": None}
+                state.pop("multi_booking", None)
                 self._save_conversation_state(sender, state)
                 return "❌ Reservation cancelled. How else can I help you today? 😊"
             return None
@@ -707,9 +717,16 @@ Message: {message}
 
             return "I do not see any active reservations for you. Would you like to make one?"
 
-        # Check if we're in the middle of a reservation flow
         if state["awaiting"] is not None:
             return self._continue_reservation_flow(message, state, sender)
+
+        if any(phrase in lower_message for phrase in ["two reservations", "2 reservations", "two reservation", "two bookings", "book two reservations", "i want to book two reservations"]):
+            state["multi_booking"] = [
+                {"name": None, "date": None, "time": None, "party_size": None},
+                {"name": None, "date": None, "time": None, "party_size": None},
+            ]
+            state["awaiting"] = "multi_name"
+            return "Absolutely — I can help with that. For the first reservation, what name should I book under?"
 
         # Reuse the same reservation details for follow-up requests like
         # "make another reservation for Friday with the same now"
@@ -769,6 +786,9 @@ Message: {message}
         """
         Continue an existing reservation flow based on what we're awaiting.
         """
+        if state.get("multi_booking"):
+            return self._continue_multi_reservation_flow(message, state, sender)
+
         details = state["reservation_details"]
 
         # Extract any information from the message
@@ -822,6 +842,163 @@ Message: {message}
             return response
 
         return "I'm not sure what you mean. Let's start over. What name should I book under?"
+
+    def _continue_multi_reservation_flow(self, message: str, state: dict, sender: str) -> str:
+        pending = state["multi_booking"]
+        lower_message = message.lower().strip()
+
+        if state["awaiting"] == "multi_name":
+            first_name, second_name = self._parse_two_names(message)
+            if first_name:
+                pending[0]["name"] = first_name
+            if second_name:
+                pending[1]["name"] = second_name
+            if not first_name and not second_name:
+                return "For the first reservation, what name should I book under?"
+            state["awaiting"] = "multi_date"
+            self._save_conversation_state(sender, state)
+            return "Great, what date would you like to reserve for the first and second reservation?"
+
+        if state["awaiting"] == "multi_date":
+            first_date, second_date = self._parse_two_dates(message)
+            if first_date:
+                pending[0]["date"] = first_date
+            if second_date:
+                pending[1]["date"] = second_date
+            if not first_date and not second_date:
+                return "What date should the first and second reservations be for?"
+            state["awaiting"] = "multi_time"
+            self._save_conversation_state(sender, state)
+            return "Perfect. What time would you like for both reservations?"
+
+        if state["awaiting"] == "multi_time":
+            first_time, second_time = self._parse_two_times(message)
+            if first_time:
+                pending[0]["time"] = first_time
+            if second_time:
+                pending[1]["time"] = second_time
+            if not first_time and not second_time:
+                time_match = self._extract_reservation_details(message, state).get("time")
+                if time_match:
+                    pending[0]["time"] = time_match
+                    pending[1]["time"] = time_match
+                else:
+                    return "What time would you like for both reservations?"
+            state["awaiting"] = "multi_party_size"
+            self._save_conversation_state(sender, state)
+            return "Wonderful. How many guests will be joining you for each reservation?"
+
+        if state["awaiting"] == "multi_party_size":
+            first_party, second_party = self._parse_two_party_sizes(message)
+            if first_party:
+                pending[0]["party_size"] = first_party
+            if second_party:
+                pending[1]["party_size"] = second_party
+            if not first_party and not second_party:
+                party_match = self._extract_reservation_details(message, state).get("party_size")
+                if party_match:
+                    pending[0]["party_size"] = party_match
+                    pending[1]["party_size"] = party_match
+                else:
+                    return "How many guests will be joining you for each reservation?"
+            for reservation in pending:
+                if not all(reservation.get(key) for key in ["name", "date", "time", "party_size"]):
+                    return "I need all details for both reservations before I can save them."
+            state["awaiting"] = None
+            state.pop("multi_booking", None)
+            for reservation in pending:
+                self._save_reservation(sender, reservation)
+            response = "Thanks! I have your reservation details."
+            self._save_conversation_state(sender, state)
+            return response
+
+        return "I'm not sure what you mean. Could you please clarify your reservation details?"
+
+    def _parse_two_names(self, message: str):
+        lower_message = message.lower()
+        first_match = re.search(r"first.*?(?:under\s+(?:the\s+)?name\s+(?:of\s+)?|name\s+(?:is\s+)?)([a-z][a-z\s'-]*)", lower_message)
+        second_match = re.search(r"second.*?(?:under\s+(?:the\s+)?name\s+(?:of\s+)?|name\s+(?:is\s+)?)([a-z][a-z\s'-]*)", lower_message)
+        if first_match:
+            first = first_match.group(1).title().strip()
+        else:
+            first = None
+        if second_match:
+            second = second_match.group(1).title().strip()
+        else:
+            second = None
+        return first, second
+
+    def _parse_two_dates(self, message: str):
+        lowered = message.lower()
+        first_date = None
+        second_date = None
+        if "first" in lowered and "second" in lowered:
+            first_match = re.search(r"first.*?(tomorrow|today|next tomorrow|next day|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}(?:st|nd|rd|th)?\s+(?:january|february|march|april|may|june|july|august|september|october|november|december))", lowered)
+            second_match = re.search(r"second.*?(tomorrow|today|next tomorrow|next day|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}(?:st|nd|rd|th)?\s+(?:january|february|march|april|may|june|july|august|september|october|november|december))", lowered)
+            if first_match:
+                first_date = first_match.group(1).title()
+            if second_match:
+                second_date = second_match.group(1).title()
+        return first_date, second_date
+
+    def _parse_two_times(self, message: str):
+        lower_message = message.lower()
+        if "both" in lower_message or "for both" in lower_message:
+            time_match = re.search(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", lower_message)
+            if time_match:
+                value = time_match.group(1).upper()
+                return value, value
+        first_time = None
+        second_time = None
+        if "first" in lower_message:
+            first_match = re.search(r"first.*?(\d{1,2}(?::\d{2})?\s*(?:am|pm))", lower_message)
+            if first_match:
+                first_time = first_match.group(1).upper()
+        if "second" in lower_message:
+            second_match = re.search(r"second.*?(\d{1,2}(?::\d{2})?\s*(?:am|pm))", lower_message)
+            if second_match:
+                second_time = second_match.group(1).upper()
+        return first_time, second_time
+
+    def _parse_two_party_sizes(self, message: str):
+        lower_message = message.lower()
+        if "for both" in lower_message or "both" in lower_message:
+            party_match = re.search(r"(\d+)\s*(?:for\s+both|both)", lower_message)
+            if party_match:
+                value = party_match.group(1)
+                return value, value
+        first_party = None
+        second_party = None
+        if "first" in lower_message:
+            first_match = re.search(r"first.*?(\d+)", lower_message)
+            if first_match:
+                first_party = first_match.group(1)
+        if "second" in lower_message:
+            second_match = re.search(r"second.*?(\d+)", lower_message)
+            if second_match:
+                second_party = second_match.group(1)
+        return first_party, second_party
+
+    def _update_specific_reservation(self, sender: str, index: int, field: str, value: str):
+        if value is None:
+            return False
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT id FROM reservations WHERE sender = ? AND status = 'active' ORDER BY id ASC",
+                    (self._normalize_sender(sender),),
+                ).fetchall()
+                if index < 0 or index >= len(rows):
+                    return False
+                reservation_id = rows[index][0]
+                conn.execute(
+                    f"UPDATE reservations SET {field} = ? WHERE id = ?",
+                    (value, reservation_id),
+                )
+                conn.commit()
+                return True
+        except Exception:
+            return False
 
     def _save_reservation(self, sender: str, details: dict):
         """
