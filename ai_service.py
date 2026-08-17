@@ -87,7 +87,7 @@ class AIAssistant:
 
         self.system_prompt = f"""You are a friendly and helpful AI assistant for {self.business_info['name']}.
 Your role is to:
-1. Answer questions about the menu, prices, opening hours, and location
+1. Answer questions about the menu, prices, opening hours, and location using ONLY the Business Information below
 2. Take reservations by collecting: name, date, time, and number of guests
 3. Handle common customer inquiries professionally
 4. Forward important or complex requests to human staff by indicating "HUMAN_NEEDED: [reason]"
@@ -97,6 +97,8 @@ Business Information:
 
 Guidelines:
 - Be friendly, professional, and concise
+- Answer menu questions (e.g. "what do you have", "what food do you serve", "what is on the menu") by listing actual items and prices from the menu data above. Never say you don't have a menu.
+- If asked about a specific dish, give its price and description when available
 - For reservations, collect all required information
 - If a request is complex, urgent, or requires human judgment, use HUMAN_NEEDED
 - Keep responses under 160 characters when possible (WhatsApp limit)
@@ -212,7 +214,7 @@ Guidelines:
         if not hasattr(self, "groq_client"):
             self.groq_client = None
         if not hasattr(self, "groq_model"):
-            self.groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+            self.groq_model = os.getenv("GROQ_MODEL", "groq/compound-mini")
 
         state = self.conversation_state.setdefault(
             sender,
@@ -224,6 +226,8 @@ Guidelines:
         )
         state["history"].append({"role": "user", "content": message})
 
+        # Let Groq interpret the message first. Only deterministic reservation
+        # handling (booking steps, status) stays rule-based so the flow stays reliable.
         if state["awaiting"] is None and self.groq_client:
             groq_intent = self._infer_groq_intent(message, state)
             if groq_intent:
@@ -261,18 +265,25 @@ Guidelines:
                     state["history"].append({"role": "assistant", "content": response})
                     return response
 
-                if intent == "business_info":
-                    business_response = self._handle_business_info_query(message, state)
-                    if business_response is not None:
-                        self._save_conversation_state(sender, state)
-                        state["history"].append({"role": "assistant", "content": business_response})
-                        return business_response
-
                 if intent == "greeting":
                     response = "Hello! I can help you with reservations, opening hours, menu info, and location details. How can I assist you today?"
                     state["history"].append({"role": "assistant", "content": response})
                     self._save_conversation_state(sender, state)
                     return response
+
+                # business_info: let Groq answer directly using the business
+                # information in its system prompt instead of hardcoded phrases.
+                # "general" intentionally falls through so the deterministic
+                # reservation flow can still catch booking requests.
+                if intent == "business_info":
+                    ai_response = self._generate_groq_response(message, state)
+                    if ai_response:
+                        state["history"].append({"role": "assistant", "content": ai_response})
+                        self._save_conversation_state(sender, state)
+                        if "HUMAN_NEEDED:" in ai_response:
+                            self.forward_to_staff(message, sender, ai_response)
+                            return "Your request has been forwarded to our team. They'll get back to you shortly! 👨‍💼"
+                        return ai_response
 
         compound_response = self._handle_compound_request(message, state, sender)
         if compound_response is not None:
