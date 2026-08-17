@@ -271,7 +271,7 @@ def test_grok_status_reading_handles_multiple_reservations_without_restarting_bo
     assistant._save_reservation("+15551234572", {"name": "Alex", "date": "Friday", "time": "6PM", "party_size": "4"})
     assistant._save_reservation("+15551234572", {"name": "Sam", "date": "Saturday", "time": "7PM", "party_size": "2"})
 
-    monkeypatch.setattr(assistant, "_infer_grok_intent", lambda message, state: {"intent": "reservation_status", "reservation_details": {}})
+    monkeypatch.setattr(assistant, "_infer_groq_intent", lambda message, state: {"intent": "reservation_status", "reservation_details": {}})
 
     response = assistant.generate_response("ok what are the reservation details for the two", "+15551234572")
 
@@ -295,7 +295,7 @@ def test_unknown_message_asks_for_clarification_when_grok_cannot_understand(monk
     assistant.db_path = os.path.join(os.getcwd(), "tmp_grok_clarify_test.sqlite3")
     assistant._init_db()
 
-    monkeypatch.setattr(assistant, "_infer_grok_intent", lambda message, state: None)
+    monkeypatch.setattr(assistant, "_infer_groq_intent", lambda message, state: None)
 
     response = assistant.generate_response("asdkjlasd qwe zxc", "+15551234573")
 

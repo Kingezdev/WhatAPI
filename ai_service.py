@@ -36,7 +36,6 @@ class AIAssistant:
         self.groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         
         # Initialize Hugging Face (secondary fallback)
-        self.huggingface_client = None
         self.huggingface_api_token = os.getenv("HUGGINGFACE_API_TOKEN")
         self.huggingface_model = os.getenv("HUGGINGFACE_MODEL", "google/flan-t5-base")
         
@@ -54,7 +53,8 @@ class AIAssistant:
                 "main_courses": [
                     {"name": "Grilled Salmon", "price": "$24.99", "description": "Atlantic salmon with lemon butter sauce"},
                     {"name": "Beef Burger", "price": "$16.99", "description": "Angus beef with lettuce, tomato, and fries"},
-                    {"name": "Pasta Carbonara", "price": "$18.99", "description": "Creamy pasta with bacon and parmesan"}
+                    {"name": "Pasta Carbonara", "price": "$18.99", "description": "Creamy pasta with bacon and parmesan"},
+                    {"name": "Jollof Rice", "price": "$14.99", "description": "Nigerian-style rice cooked in a rich tomato and pepper sauce with grilled chicken"}
                 ],
                 "desserts": [
                     {"name": "Chocolate Cake", "price": "$7.99", "description": "Rich chocolate layer cake"},
@@ -64,6 +64,9 @@ class AIAssistant:
                     {"name": "Soft Drinks", "price": "$3.99", "description": "Coke, Sprite, Fanta"},
                     {"name": "Fresh Juice", "price": "$6.99", "description": "Orange, Apple, or Mango juice"},
                     {"name": "Coffee", "price": "$4.99", "description": "Espresso, Cappuccino, Latte"}
+                ],
+                "kids_menu": [
+                    {"name": "Kids Meal", "price": "$8.99", "description": "Small portion with fries and a drink"}
                 ]
             },
             "opening_hours": {
@@ -200,9 +203,10 @@ Guidelines:
 
     def generate_response(self, message: str, sender: str) -> str:
         """
-        Generate AI response using Groq only.
+        Generate AI response using Groq.
         Business rules and reservation flow still run first.
         If Groq is unavailable or fails, return a simple call-for-enquiries message.
+        If Groq is available but cannot produce a response, ask for clarification.
         """
         sender = self._normalize_sender(sender)
         if not hasattr(self, "groq_client"):
@@ -221,10 +225,10 @@ Guidelines:
         state["history"].append({"role": "user", "content": message})
 
         if state["awaiting"] is None and self.groq_client:
-            grok_intent = self._infer_grok_intent(message, state)
-            if grok_intent:
-                intent = grok_intent.get("intent")
-                extracted = grok_intent.get("reservation_details") or {}
+            groq_intent = self._infer_groq_intent(message, state)
+            if groq_intent:
+                intent = groq_intent.get("intent")
+                extracted = groq_intent.get("reservation_details") or {}
                 booking_ready = all(extracted.get(key) is not None for key in ["name", "date", "time", "party_size"])
 
                 if intent == "reservation_status":
@@ -288,19 +292,17 @@ Guidelines:
             state["history"].append({"role": "assistant", "content": reservation_flow})
             return reservation_flow
 
-        if self.groq_client and not self._is_supported_use_case(message):
-            # Only ask for clarification after the normal reservation and business rules have failed.
-            # This keeps the booking flow deterministic while still allowing Grok to interpret natural language.
-            state["history"].append({"role": "assistant", "content": "I'm not sure what you mean. Could you please clarify?"})
-            self._save_conversation_state(sender, state)
-            return "I'm not sure what you mean. Could you please clarify?"
-
-        ai_response = None
         if self.groq_client:
             ai_response = self._generate_groq_response(message, state)
+        else:
+            ai_response = None
 
         if not ai_response:
-            ai_response = "Please call for more enquiries."
+            ai_response = (
+                "I'm not sure what you mean. Could you please clarify?"
+                if self.groq_client
+                else "Please call for more enquiries."
+            )
 
         state["history"].append({"role": "assistant", "content": ai_response})
         self._save_conversation_state(sender, state)
@@ -333,41 +335,18 @@ Guidelines:
                 top_p=0.9,
             )
 
-            response = chat_completion.choices[0].message.content.strip()
-            return response
+            response = chat_completion.choices[0].message.content
+            if not isinstance(response, str):
+                return None
+            return response.strip()
 
         except Exception as e:
             print(f"Groq API error: {e}")
             return None
 
-    def _generate_openai_response(self, message: str, state: dict) -> Optional[str]:
+    def _infer_groq_intent(self, message: str, state: dict) -> dict | None:
         """
-        Generate response using OpenAI API (fallback from Groq)
-        """
-        try:
-            if not self.client:
-                return None
-
-            history_messages = [{"role": "system", "content": self.system_prompt}]
-            for item in state["history"][-6:]:
-                history_messages.append({"role": item["role"], "content": item["content"]})
-
-            response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=history_messages,
-                max_tokens=150,
-                temperature=0.7
-            )
-
-            return response.choices[0].message.content.strip()
-
-        except Exception as e:
-            print(f"OpenAI API error: {e}")
-            return None
-
-    def _infer_grok_intent(self, message: str, state: dict) -> dict | None:
-        """
-        Ask Grok to classify the message and extract reservation details before the hardcoded flow takes over.
+        Ask Groq to classify the message and extract reservation details before the hardcoded flow takes over.
         This keeps a safe fallback, but lets the model decide intent using context instead of a growing list of phrases.
         """
         try:
@@ -414,90 +393,35 @@ Message: {message}
             print(f"Groq intent parsing error: {e}")
         return None
 
-    def _is_supported_use_case(self, message: str) -> bool:
-        lower_message = message.lower().strip()
-        supported_topics = [
-            "menu", "vegetarian", "veggie", "kids", "popular", "dish", "jollof", "open", "hours",
-            "sunday", "located", "location", "address", "deliver", "delivery", "reservation", "book",
-            "reserve", "table", "guest", "party", "hello", "hi", "hey", "good morning", "good afternoon",
-            "good evening", "thank", "thanks", "cancel", "nevermind", "how many", "status"
-        ]
-        if any(topic in lower_message for topic in supported_topics):
-            return True
-
-        if lower_message in {"", "?"}:
-            return False
-
-        return False
-
-    def _generate_huggingface_response(self, message: str, sender: str) -> Optional[str]:
-        """
-        Generate response using Hugging Face API (final fallback)
-        """
-        if not self._is_supported_use_case(message):
-            return "Please call for more enquiries."
-
-        token = self.huggingface_api_token or os.getenv("HUGGINGFACE_API_TOKEN")
-        if not token or InferenceClient is None:
-            return None
-
-        model = self.huggingface_model or os.getenv("HUGGINGFACE_MODEL", "google/flan-t5-base")
-        prompt = (
-            f"You are a helpful restaurant assistant for {self.business_info.get('name', 'this business')}. "
-            f"Only answer questions related to the restaurant's menu, opening hours, location, delivery, or reservations. "
-            f"If the message is unrelated, respond briefly with: Please call for more enquiries. "
-            f"Customer message: {message}"
-        )
-
-        try:
-            if self.huggingface_client is None:
-                self.huggingface_client = InferenceClient(model=model, token=token)
-
-            response = None
-            try:
-                response = self.huggingface_client.text2text_generation(
-                    prompt,
-                    max_new_tokens=80,
-                    temperature=0.2,
-                    do_sample=False,
-                )
-            except Exception as text2text_error:
-                print(f"text2text_generation failed: {text2text_error}")
-                try:
-                    response = self.huggingface_client.text_generation(
-                        prompt,
-                        max_new_tokens=80,
-                        temperature=0.2,
-                        do_sample=False,
-                    )
-                except Exception as text_generation_error:
-                    print(f"text_generation failed: {text_generation_error}")
-
-            if isinstance(response, list):
-                response = response[0].get("generated_text", "") if response and isinstance(response[0], dict) else ""
-            if isinstance(response, str):
-                return response.strip() or None
-        except Exception as e:
-            print(f"Error calling Hugging Face: {e}")
-
-        return None
-
     def _handle_business_info_query(self, message: str, state: dict) -> str | None:
         lower_message = message.lower().strip()
         menu = self.business_info.get("menu", {})
         opening_hours = self.business_info.get("opening_hours", {})
         location = self.business_info.get("location", {})
 
+        specific_topics = ["kids menu", "vegetarian", "veggie"]
+        menu_query = (
+            "menu" in lower_message
+            or "what do you serve" in lower_message
+            or "what do you have" in lower_message
+            or "what do you sell" in lower_message
+            or "what do you offer" in lower_message
+            or "what food" in lower_message
+            or "what dish" in lower_message
+        ) and not any(topic in lower_message for topic in specific_topics)
         if any(phrase in lower_message for phrase in [
             "what's on your menu", "what is on your menu", "what is on the menu",
-            "what's on the menu", "what is your menu", "what's your menu"
-        ]):
+            "what's on the menu", "what is your menu", "what's your menu",
+            "show me the menu", "show your menu", "menu list", "menu information",
+            "menu items", "what menu", "what's on the menu today"
+        ]) or menu_query:
             items = []
             for section in ["appetizers", "main_courses", "desserts", "drinks", "kids_menu"]:
                 for item in menu.get(section, []):
                     name = item.get("name")
                     if name:
-                        items.append(name)
+                        price = item.get("price")
+                        items.append(f"{name} ({price})" if price else name)
             if items:
                 return f"We offer: {', '.join(items[:8])}."
             return "We have a variety of dishes available."
@@ -982,6 +906,9 @@ Message: {message}
     def _update_specific_reservation(self, sender: str, index: int, field: str, value: str):
         if value is None:
             return False
+        allowed_fields = {"name", "date", "time", "party_size"}
+        if field not in allowed_fields:
+            return False
         try:
             with sqlite3.connect(self.db_path) as conn:
                 rows = conn.execute(
@@ -1064,15 +991,6 @@ Message: {message}
             print(f"Error retrieving reservations: {e}")
             return []
 
-    def _get_saved_reservation(self, state: dict) -> dict | None:
-        """
-        Get a single saved reservation (for backward compatibility).
-        """
-        reservations = self._get_active_reservations("reservation")  # Default sender
-        if reservations:
-            return reservations[0]
-        return None
-
     def _extract_reservation_details(self, message: str, state: dict | None = None) -> dict:
         details = {"name": None, "date": None, "time": None, "party_size": None}
         lower_message = message.lower()
@@ -1146,11 +1064,6 @@ Message: {message}
             numeric_match = re.search(r"\b(\d+)\b", lower_message)
             if numeric_match:
                 details["party_size"] = numeric_match.group(1)
-
-        if not details["time"] and re.search(r"\b(\d{1,2})\b", lower_message):
-            numeric_match = re.search(r"\b(\d{1,2})\b", lower_message)
-            if numeric_match and numeric_match.group(1) not in {"2", "4", "6", "8"}:
-                details["time"] = numeric_match.group(1)
 
         return details
 
