@@ -41,6 +41,7 @@ class AIAssistant:
         
         self.db_path = db_path or os.getenv("SQLITE_DB_PATH", "conversations.sqlite3")
         self._init_db()
+        print("AI provider status:", self.get_ai_provider_status(), flush=True)
         
         self.business_info = {
             "name": "Your Business Name",
