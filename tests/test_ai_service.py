@@ -11,6 +11,20 @@ import main
 from ai_service import AIAssistant
 
 
+def test_groq_unavailable_returns_explicit_not_available_message():
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.groq_client = None
+    assistant.groq_model = "test-model"
+    assistant.business_info = {"name": "Test Restaurant"}
+    assistant.system_prompt = "system"
+    assistant.conversation_state = {}
+    assistant.forward_to_staff = lambda *args, **kwargs: None
+
+    response = assistant.generate_response("hello", "+15551234571")
+
+    assert response == "Groq AI is currently unavailable. Please try again later."
+
+
 def test_reservation_context_is_retained_per_sender(monkeypatch):
     assistant = AIAssistant.__new__(AIAssistant)
     assistant.client = Mock()

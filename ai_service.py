@@ -206,10 +206,10 @@ Guidelines:
 
     def generate_response(self, message: str, sender: str) -> str:
         """
-        Generate AI response using Groq.
-        Business rules and reservation flow still run first.
-        If Groq is unavailable or fails, return a simple call-for-enquiries message.
-        If Groq is available but cannot produce a response, ask for clarification.
+        Generate AI response using Groq as the only active provider.
+        Legacy fallback chatbot branches are intentionally disabled to avoid
+        conflicts between providers. If Groq is unavailable or fails, we return
+        a clear outage message instead of silently switching providers.
         """
         sender = self._normalize_sender(sender)
         if not hasattr(self, "groq_client"):
@@ -226,6 +226,15 @@ Guidelines:
             },
         )
         state["history"].append({"role": "user", "content": message})
+
+        # Legacy fallback chatbot logic is intentionally disabled so the app only
+        # responds through Groq. If Groq is unavailable we stop here instead of
+        # falling back to business-rule responses or alternative providers.
+        if not self.groq_client:
+            response = "Groq AI is currently unavailable. Please try again later."
+            state["history"].append({"role": "assistant", "content": response})
+            self._save_conversation_state(sender, state)
+            return response
 
         # Let Groq interpret the message first. Only deterministic reservation
         # handling (booking steps, status) stays rule-based so the flow stays reliable.
@@ -286,35 +295,51 @@ Guidelines:
                             return "Your request has been forwarded to our team. They'll get back to you shortly! 👨‍💼"
                         return ai_response
 
-        compound_response = self._handle_compound_request(message, state, sender)
-        if compound_response is not None:
-            state["history"].append({"role": "assistant", "content": compound_response})
-            self._save_conversation_state(sender, state)
-            return compound_response
+        # Legacy fallback chatbot branches are no longer used. Keeping them commented
+        # here makes it easier to track where the provider conflicts used to happen.
+        # compound_response = self._handle_compound_request(message, state, sender)
+        # if compound_response is not None:
+        #     state["history"].append({"role": "assistant", "content": compound_response})
+        #     self._save_conversation_state(sender, state)
+        #     return compound_response
 
-        business_response = self._handle_business_info_query(message, state)
-        if business_response is not None:
-            self._save_conversation_state(sender, state)
-            state["history"].append({"role": "assistant", "content": business_response})
-            return business_response
+        # business_response = self._handle_business_info_query(message, state)
+        # if business_response is not None:
+        #     self._save_conversation_state(sender, state)
+        #     state["history"].append({"role": "assistant", "content": business_response})
+        #     return business_response
 
-        reservation_flow = self._handle_reservation_flow(message, state, sender)
-        if reservation_flow is not None:
-            self._save_conversation_state(sender, state)
-            state["history"].append({"role": "assistant", "content": reservation_flow})
-            return reservation_flow
+        # reservation_flow = self._handle_reservation_flow(message, state, sender)
+        # if reservation_flow is not None:
+        #     self._save_conversation_state(sender, state)
+        #     state["history"].append({"role": "assistant", "content": reservation_flow})
+        #     return reservation_flow
 
-        if self.groq_client:
-            ai_response = self._generate_groq_response(message, state)
-        else:
-            ai_response = None
+        # Legacy fallback chatbot logic is intentionally disabled to keep the app
+        # on a single provider path. Any conflict or branch that would route away
+        # from Groq should be treated as a provider issue and not as a normal reply.
+        # compound_response = self._handle_compound_request(message, state, sender)
+        # if compound_response is not None:
+        #     state["history"].append({"role": "assistant", "content": compound_response})
+        #     self._save_conversation_state(sender, state)
+        #     return compound_response
+
+        # business_response = self._handle_business_info_query(message, state)
+        # if business_response is not None:
+        #     self._save_conversation_state(sender, state)
+        #     state["history"].append({"role": "assistant", "content": business_response})
+        #     return business_response
+
+        # reservation_flow = self._handle_reservation_flow(message, state, sender)
+        # if reservation_flow is not None:
+        #     self._save_conversation_state(sender, state)
+        #     state["history"].append({"role": "assistant", "content": reservation_flow})
+        #     return reservation_flow
+
+        ai_response = self._generate_groq_response(message, state) if self.groq_client else None
 
         if not ai_response:
-            ai_response = (
-                "I'm not sure what you mean. Could you please clarify?"
-                if self.groq_client
-                else "Please call for more enquiries."
-            )
+            ai_response = "Groq AI is currently unavailable. Please try again later."
 
         state["history"].append({"role": "assistant", "content": ai_response})
         self._save_conversation_state(sender, state)
